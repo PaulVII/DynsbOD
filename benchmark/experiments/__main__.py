@@ -17,7 +17,15 @@ def discover_modules(package_name):
         if name.startswith("_") or name == "__main__":
             continue
         module_names.append(f"{package_name}.{name}")
-    return sorted(module_names)
+
+    # Ensure 'intermediate' runs first, as it creates data used by other experiments
+    def sort_key(mod):
+        name = mod.rsplit(".", 1)[-1]
+        if name == "intermediate":
+            return (0, name)
+        return (1, name)
+
+    return sorted(module_names, key=sort_key)
 
 
 def main():
