@@ -193,7 +193,7 @@ sbt "runMain Benchmark"
 The `benchmark/` Python package is separate from `Benchmark.scala` and is used to generate the experimental data presented in the thesis. It contains the following runners:
 
 - **`dynsbod_runner.py`** — Runs DynsbOD (requires building the JAR with dependencies) with configurable algorithm settings, JVM options, and dataset presets. Used for all DynsbOD experiments in the thesis evaluation.
-- **`dynfd_runner.py`** — Runs DynFD (`benchmark/dynfd.jar`), a competing incremental FD discovery algorithm. Used as a baseline for comparison in the thesis evaluation.
+- **`dynfd_runner.py`** — Runs DynFD (`benchmark/dynfd.jar`), a incremental FD discovery algorithm. Used as a baseline for comparison in the thesis evaluation. Our modifications to DynFD can be found [here](https://github.com/PaulVII/dynfd)
 - **`static_algorithm/run_static_algorithm.py`** — Runs the static HyOD algorithm.(`datasets/HyOD_modified.jar`) on complete datasets. Used as a static baseline in the thesis evaluation. Our changes to the HyOD algorithm can be found in [this repository](https://github.com/PaulVII/HyOD/)
 - **`incpod_runner.py`** — Runs Hydra+/IncPOD, another competing approach. This runner was not used in the final thesis evaluation. IncPOD.jar and Hydra+.jar can be optained [here](https://github.com/Lab-yi/Alg)
 
