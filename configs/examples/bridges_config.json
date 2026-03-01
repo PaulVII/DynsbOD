@@ -1,0 +1,26 @@
+{
+  "$schema": "../../src/main/resources/schema/config.schema.json",
+  "data": {
+    "initial": "./datasets/samples/bridges_0_0.csv",
+    "increments": [
+      "./datasets/samples/bridges_0_50.csv",
+      "./datasets/samples/bridges_50_70.csv"
+    ]
+  },
+  "results": {
+    "initial": "./datasets/samples/results_hyod_bridges_0_0.csv.txt",
+    "increments": [
+      "./datasets/samples/results_hyod_bridges_0_50.csv.txt",
+      "./datasets/samples/results_hyod_bridges_0_70.csv.txt"
+    ]
+  },
+  "csv": {
+    "delimiter": ",",
+    "hasHeader": true,
+    "canHaveDeletions": false
+  },
+  "algo": {
+    "deletionMode": "deleteonly",
+    "skipRevalidationByInsert": true
+  }
+}

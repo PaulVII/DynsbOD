@@ -1,0 +1,20 @@
+{
+  "$schema": "../../src/main/resources/schema/config.schema.json",
+  "data": {
+    "initial": "./datasets/wikipedia/dynfd/cpu/baseline_marked.csv",
+    "increments": [
+      "./datasets/wikipedia/dynfd/cpu/events_with_updates.csv"
+    ]
+  },
+  "results": {
+    "initial": "./datasets/wikipedia/dynfd/cpu/results_hyod_baseline.csv.txt",
+    "increments": [
+      "./datasets/wikipedia/dynfd/cpu/results_hyod_final_state.csv.txt"
+    ]
+  },
+  "csv": {
+    "delimiter": ",",
+    "hasHeader": true,
+    "canHaveDeletions": true
+  }
+}

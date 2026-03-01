@@ -1,0 +1,135 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "https://example.org/algo-config.schema.json",
+    "title": "Algorithm Configuration",
+    "type": "object",
+    "required": [
+        "data",
+        "results",
+        "csv"
+    ],
+    "properties": {
+        "$schema": {
+            "type": "string"
+        },
+        "output": {
+            "type": "string"
+        },
+        "data": {
+            "type": "object",
+            "properties": {
+                "initial": {
+                    "type": "string",
+                    "minLength": 1
+                },
+                "increments": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "minLength": 1
+                    },
+                    "default": []
+                }
+            },
+            "additionalProperties": false,
+            "default": {}
+        },
+        "results": {
+            "type": "object",
+            "properties": {
+                "initial": {
+                    "type": "string",
+                    "minLength": 1
+                },
+                "increments": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "minLength": 1
+                    },
+                    "default": []
+                }
+            },
+            "additionalProperties": false,
+            "default": {}
+        },
+        "csv": {
+            "type": "object",
+            "properties": {
+                "delimiter": {
+                    "type": "string",
+                    "minLength": 1,
+                    "default": ","
+                },
+                "hasHeader": {
+                    "type": "boolean",
+                    "default": false
+                },
+                "canHaveDeletions": {
+                    "type": "boolean",
+                    "default": false
+                },
+                "columnsToInclude": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "minLength": 1
+                    },
+                    "description": "Optional list of column names to include. If specified, only these columns will be loaded from the CSV. ODs referencing other columns will be ignored."
+                }
+            },
+            "additionalProperties": false,
+            "default": {}
+        },
+        "algo": {
+            "type": "object",
+            "properties": {
+                "deletionMode": {
+                    "type": "string",
+                    "enum": [
+                        "none",
+                        "afterinsert",
+                        "deleteonly"
+                    ]
+                },
+                "minMaxCacheThreshold": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "default": 20
+                },
+                "skipRevalidationByInsert": {
+                    "type": "boolean",
+                    "default": false
+                },
+                "disableEfficientUpdates": {
+                    "type": "boolean",
+                    "default": false
+                },
+                "optimizeBuildOrder": {
+                    "type": "boolean",
+                    "default": true
+                },
+                "showProgressBar": {
+                    "type": "boolean",
+                    "default": true
+                },
+                "useLazyList": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Use LazyList for context iterators. When false, uses IndexedSeq (eagerly evaluated)."
+                }
+            },
+            "additionalProperties": false,
+            "default": {}
+        },
+        "intermediateStatsPath": {
+            "type": "string",
+            "description": "Optional path prefix for writing intermediate statistics to CSV files. When set, stats are collected every ~1/200 operations and written to {prefix}_insert_{idx}.csv or {prefix}_delete_{idx}.csv"
+        },
+        "perTupleTimingPath": {
+            "type": "string",
+            "description": "Optional path for writing per-tuple timing data to CSV file. When set, records the time taken for each insert, delete, and update operation (with update split into delete and insert phases)."
+        }
+    },
+    "additionalProperties": false
+}
