@@ -148,7 +148,7 @@ Example:
 python preprocess_dataset.py flights.csv 100 1000 10000 --convert-int --null_option remove --rest
 ```
 
-This produces sample CSVs in `datasets/samples/` and a matching config JSON in `configs/`.
+This produces sample CSVs in `datasets/samples/` and a matching config JSON in `configs/`. Note that this config presumes presumes the first batch to be the baseline, and requires a file containing the existing ODs on it. If you want to precompute these ODs with DynsbOD, you can copy the config, move the file under `data.initial` to be the first entry in `data.increments`, and delete all keys in the `results` object. Alternatively, you can use our modified version of [HyOD](github.com/PaulVII/HyOD/) that computes ODs on a file and outputs them in the required format.
 
 Run `python preprocess_dataset.py --help` for the full list of options (NULL handling, column sampling, rank-encoding, etc.).
 
