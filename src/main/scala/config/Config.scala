@@ -44,6 +44,9 @@ final case class AlgoConfig(
     skipRevalidationByInsert: Boolean = true,
     useEfficientUpdates: Boolean = true,
     optimizeBuildOrder: Boolean = true,
+    // measured slower than the full wipe on adult insert at every heap
+    // size from 4g down to 900m
+    partialCacheEviction: Boolean = false,
     showProgressBar: Boolean = true,
     useLazyList: Boolean = false
 )
@@ -100,6 +103,7 @@ object AppConfig:
       "skipRevalidationByInsert",
       "useEfficientUpdates",
       "optimizeBuildOrder",
+      "partialCacheEviction",
       "showProgressBar",
       "useLazyList"
     )
@@ -122,6 +126,9 @@ object AppConfig:
           "useEfficientUpdates"
         )(true)
         optimizeBuildOrder <- c.getOrElse[Boolean]("optimizeBuildOrder")(true)
+        partialCacheEviction <- c.getOrElse[Boolean]("partialCacheEviction")(
+          false
+        )
         showProgressBar <- c.getOrElse[Boolean]("showProgressBar")(true)
         useLazyList <- c.getOrElse[Boolean]("useLazyList")(true)
       yield AlgoConfig(
@@ -130,6 +137,7 @@ object AppConfig:
         skipRevalidationByInsert = skipRevalidationByInsert,
         useEfficientUpdates = useEfficientUpdates,
         optimizeBuildOrder = optimizeBuildOrder,
+        partialCacheEviction = partialCacheEviction,
         showProgressBar = showProgressBar,
         useLazyList = useLazyList
       )

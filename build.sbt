@@ -26,7 +26,7 @@ lazy val root = project
   .enablePlugins(ScalafixPlugin)
   .settings(
     name := "dynsbod",
-    version := "1.0.0",
+    version := "1.0.1",
     scalaVersion := scala3Version,
     assembly / mainClass := Some("main"),
     assembly / assemblyMergeStrategy := {

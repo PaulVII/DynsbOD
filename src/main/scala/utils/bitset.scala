@@ -7,6 +7,40 @@ extension (b: BitSet.type)
   def ones(numAttributes: Int): BitSet =
     b(0 until numAttributes*)
 
+/** Number of 64-bit words needed to hold bits `0 until numBits`. */
+inline def wordsFor(numBits: Int): Int = math.max(1, (numBits + 63) >>> 6)
+
+/** Copies the bits of `bs` into the first `stride` words of `out`.
+  *
+  * `BitSet.toBitMask` builds a fresh `Array[Long]` on every call, so callers
+  * that compare one set against many should do this once per query instead of
+  * once per comparison.
+  */
+def writeWords(bs: BitSet, out: Array[Long], stride: Int): Unit =
+  val mask = bs.toBitMask
+  val shared = math.min(stride, mask.length)
+  System.arraycopy(mask, 0, out, 0, shared)
+  var w = shared
+  while w < stride do
+    out(w) = 0L
+    w += 1
+  // Guard the class invariant: no element may lie outside the declared universe
+  while w < mask.length do
+    require(mask(w) == 0L, s"BitSet $bs exceeds the ${stride * 64}-bit universe")
+    w += 1
+
+/** Order-independent hash over the words of a set, so we never fall back to
+  * `MurmurHash3.unorderedHash`, which walks (and boxes) every element.
+  */
+private def hashWords(words: Array[Long], offset: Int, stride: Int): Int =
+  var h = 0
+  var w = 0
+  while w < stride do
+    val v = words(offset + w)
+    h = h * 31 + (v ^ (v >>> 32)).toInt
+    w += 1
+  h
+
 /** Fast subset check avoiding boxing overhead. Uses the underlying Long array
   * directly via BitSet.toBitMask.
   */
@@ -24,131 +58,193 @@ extension (a: BitSet)
       i += 1
     isSubset
 
-  /** Fast equality check avoiding boxing overhead. Compares underlying Long
-    * arrays directly.
-    */
-  inline def fastEquals(b: BitSet): Boolean =
-    val aMask = a.toBitMask
-    val bMask = b.toBitMask
-    val maxLen = math.max(aMask.length, bMask.length)
-    var i = 0
-    var isEqual = true
-    while i < maxLen && isEqual do
-      val aWord = if i < aMask.length then aMask(i) else 0L
-      val bWord = if i < bMask.length then bMask(i) else 0L
-      if aWord != bWord then isEqual = false
-      i += 1
-    isEqual
-
-/** A set backed by ArrayBuffer for fast iteration, with HashSet for O(1)
-  * membership. Iteration is array-based (no iterator allocation in while
-  * loops). Add/remove/contains are O(1) average via the HashSet.
+/** One popcount bucket of a [[SizeBucketedBitSets]].
+  *
+  * The sets are held twice: as `BitSet`s, which is what callers get back, and
+  * as a flat `Array[Long]` with a fixed `stride` of words per set. All scans
+  * run over the flat array, so a subset test is a handful of primitive `and`s
+  * with no allocation, no indirection and no boxing — for universes of up to 64
+  * attributes (`stride == 1`) it is a single machine word comparison.
   */
-class FastBitSetIterSet:
-  private val arr = mutable.ArrayBuffer[BitSet]()
-  private val set = mutable.HashSet[BitSet]()
+private final class WordBucket(val stride: Int):
+  // Start empty: an index holds one bucket per possible popcount, and on wide
+  // relations most of them never receive an element.
+  private var sets: Array[BitSet] = Array.empty
+  private var words: Array[Long] = Array.emptyLongArray
+  private var hashes: Array[Int] = Array.emptyIntArray
+  private var count: Int = 0
 
-  inline def size: Int = arr.size
-  inline def isEmpty: Boolean = arr.isEmpty
-  inline def nonEmpty: Boolean = arr.nonEmpty
+  inline def size: Int = count
+  inline def apply(i: Int): BitSet = sets(i)
 
-  inline def apply(i: Int): BitSet = arr(i)
+  private def grow(): Unit =
+    val newCap = if sets.length == 0 then 4 else sets.length * 2
+    sets = java.util.Arrays.copyOf(sets, newCap)
+    words = java.util.Arrays.copyOf(words, newCap * stride)
+    hashes = java.util.Arrays.copyOf(hashes, newCap)
 
-  def contains(elem: BitSet): Boolean = set.contains(elem)
-
-  /** Fast indexOf using fastEquals to avoid boxing */
-  private def fastIndexOf(elem: BitSet): Int =
+  /** Index of the set equal to `q`, or -1. */
+  def indexOf(q: Array[Long]): Int =
+    val h = hashWords(q, 0, stride)
     var i = 0
-    while i < arr.size do
-      if arr(i).fastEquals(elem) then return i
+    while i < count do
+      if hashes(i) == h && equalsAt(i, q) then return i
       i += 1
     -1
 
-  /** Add element, returns true if it was not already present */
-  def add(elem: BitSet): Boolean =
-    if set.add(elem) then
-      arr += elem
+  private def equalsAt(i: Int, q: Array[Long]): Boolean =
+    val base = i * stride
+    var w = 0
+    while w < stride do
+      if words(base + w) != q(w) then return false
+      w += 1
+    true
+
+  /** Whether the set stored at `i` is a superset of `q`. */
+  private def isSupersetAt(i: Int, q: Array[Long]): Boolean =
+    val base = i * stride
+    var w = 0
+    while w < stride do
+      val qw = q(w)
+      if (words(base + w) & qw) != qw then return false
+      w += 1
+    true
+
+  /** Whether the set stored at `i` is a subset of `q`. */
+  private def isSubsetAt(i: Int, q: Array[Long]): Boolean =
+    val base = i * stride
+    var w = 0
+    while w < stride do
+      val sw = words(base + w)
+      if (sw & q(w)) != sw then return false
+      w += 1
+    true
+
+  /** Appends `bs` (whose words are `q`); returns false if already present. */
+  def add(bs: BitSet, q: Array[Long]): Boolean =
+    if indexOf(q) >= 0 then false
+    else
+      if count == sets.length then grow()
+      sets(count) = bs
+      System.arraycopy(q, 0, words, count * stride, stride)
+      hashes(count) = hashWords(q, 0, stride)
+      count += 1
       true
-    else false
 
-  def +=(elem: BitSet): this.type =
-    add(elem)
-    this
+  /** Removes by index, swapping the last entry into the hole. */
+  def removeAt(i: Int): Unit =
+    val last = count - 1
+    if i != last then
+      sets(i) = sets(last)
+      System.arraycopy(words, last * stride, words, i * stride, stride)
+      hashes(i) = hashes(last)
+    sets(last) = null
+    count = last
 
-  /** Remove element, returns true if it was present */
-  def remove(elem: BitSet): Boolean =
-    if set.remove(elem) then
-      // Swap with last for O(1) removal from array
-      val idx = fastIndexOf(elem)
-      if idx >= 0 then
-        val last = arr.size - 1
-        if idx != last then arr(idx) = arr(last)
-        arr.dropRightInPlace(1)
+  def remove(q: Array[Long]): Boolean =
+    val i = indexOf(q)
+    if i < 0 then false
+    else
+      removeAt(i)
       true
-    else false
 
-  def -=(elem: BitSet): this.type =
-    remove(elem)
-    this
+  def hasSupersetOf(q: Array[Long]): Boolean =
+    var i = 0
+    while i < count do
+      if isSupersetAt(i, q) then return true
+      i += 1
+    false
+
+  def hasSubsetOf(q: Array[Long]): Boolean =
+    var i = 0
+    while i < count do
+      if isSubsetAt(i, q) then return true
+      i += 1
+    false
+
+  def collectSupersetsOf(q: Array[Long], out: mutable.ArrayBuffer[BitSet]): Unit =
+    var i = 0
+    while i < count do
+      if isSupersetAt(i, q) then out += sets(i)
+      i += 1
+
+  def collectSubsetsOf(q: Array[Long], out: mutable.ArrayBuffer[BitSet]): Unit =
+    var i = 0
+    while i < count do
+      if isSubsetAt(i, q) then out += sets(i)
+      i += 1
+
+  /** Removes and collects every stored superset of `q`. */
+  def removeSupersetsOf(q: Array[Long], out: mutable.ArrayBuffer[BitSet]): Int =
+    var removed = 0
+    var i = 0
+    while i < count do
+      if isSupersetAt(i, q) then
+        out += sets(i)
+        removeAt(i) // swaps the last entry into i, so do not advance
+        removed += 1
+      else i += 1
+    removed
+
+  /** Removes and collects every stored subset of `q`. */
+  def removeSubsetsOf(q: Array[Long], out: mutable.ArrayBuffer[BitSet]): Int =
+    var removed = 0
+    var i = 0
+    while i < count do
+      if isSubsetAt(i, q) then
+        out += sets(i)
+        removeAt(i)
+        removed += 1
+      else i += 1
+    removed
 
   def clear(): Unit =
-    arr.clear()
-    set.clear()
+    java.util.Arrays.fill(sets.asInstanceOf[Array[Object]], null)
+    count = 0
 
-  /** In-place filter, keeps only elements satisfying predicate */
-  def filterInPlace(p: BitSet => Boolean): Unit =
+  def exists(p: BitSet => Boolean): Boolean =
     var i = 0
-    while i < arr.size do
-      if !p(arr(i)) then
-        set.remove(arr(i))
-        val last = arr.size - 1
-        if i != last then arr(i) = arr(last)
-        arr.dropRightInPlace(1)
-        // Don't increment i, check the swapped element
-      else i += 1
-
-  /** Check if any element satisfies predicate - uses fast array iteration */
-  inline def exists(p: BitSet => Boolean): Boolean =
-    var i = 0
-    var found = false
-    while i < arr.size && !found do
-      if p(arr(i)) then found = true
+    while i < count do
+      if p(sets(i)) then return true
       i += 1
-    found
+    false
 
-  /** Filter and collect elements satisfying predicate */
-  def filter(p: BitSet => Boolean): mutable.ArrayBuffer[BitSet] =
-    val result = mutable.ArrayBuffer[BitSet]()
+  def foreach(f: BitSet => Unit): Unit =
     var i = 0
-    while i < arr.size do
-      if p(arr(i)) then result += arr(i)
+    while i < count do
+      f(sets(i))
       i += 1
-    result
 
-  def iterator: Iterator[BitSet] = arr.iterator
-
-  def toSeq: Seq[BitSet] = arr.toSeq
-
-  override def toString: String = arr.mkString("FastBitSetIterSet(", ", ", ")")
+  def iterator: Iterator[BitSet] = sets.iterator.take(count)
 
 /** A collection of BitSets bucketed by popcount (size) for efficient
   * subset/superset queries. Subset queries only check smaller-or-equal buckets.
   * Superset queries only check larger-or-equal buckets.
+  *
+  * All elements must be subsets of `0 until maxSize`.
   */
-class SizeBucketedBitSets(val maxSize: Int):
-  private val buckets: Array[FastBitSetIterSet] =
-    Array.fill(maxSize + 1)(FastBitSetIterSet())
+final class SizeBucketedBitSets(val maxSize: Int):
+  private val stride = wordsFor(maxSize)
+  private val buckets: Array[WordBucket] =
+    Array.fill(maxSize + 1)(new WordBucket(stride))
+  // Scans never nest, so one scratch buffer per instance is enough to keep
+  // every query allocation-free.
+  private val scratch: Array[Long] = new Array[Long](stride)
   private var totalSize: Int = 0
 
   inline def size: Int = totalSize
   inline def isEmpty: Boolean = totalSize == 0
   inline def nonEmpty: Boolean = totalSize > 0
 
+  private inline def load(bs: BitSet): Array[Long] =
+    writeWords(bs, scratch, stride)
+    scratch
+
   def contains(bs: BitSet): Boolean =
-    buckets(bs.size).contains(bs)
+    buckets(bs.size).indexOf(load(bs)) >= 0
 
   def add(bs: BitSet): Boolean =
-    val added = buckets(bs.size).add(bs)
+    val added = buckets(bs.size).add(bs, load(bs))
     if added then totalSize += 1
     added
 
@@ -157,7 +253,7 @@ class SizeBucketedBitSets(val maxSize: Int):
     this
 
   def remove(bs: BitSet): Boolean =
-    val removed = buckets(bs.size).remove(bs)
+    val removed = buckets(bs.size).remove(load(bs))
     if removed then totalSize -= 1
     removed
 
@@ -176,140 +272,90 @@ class SizeBucketedBitSets(val maxSize: Int):
     * with size <= query.size.
     */
   def hasSubsetOf(query: BitSet): Boolean =
+    val q = load(query)
     val querySize = query.size
-    var bucketIdx = 0
-    while bucketIdx <= querySize && bucketIdx <= maxSize do
-      val bucket = buckets(bucketIdx)
-      var i = 0
-      while i < bucket.size do
-        if bucket(i).fastSubsetOf(query) then return true
-        i += 1
-      bucketIdx += 1
+    var b = 0
+    while b <= querySize do
+      if buckets(b).hasSubsetOf(q) then return true
+      b += 1
     false
 
   /** Check if any stored BitSet is a superset of the query. Only checks buckets
     * with size >= query.size.
     */
   def hasSupersetOf(query: BitSet): Boolean =
-    val querySize = query.size
-    var bucketIdx = querySize
-    while bucketIdx <= maxSize do
-      val bucket = buckets(bucketIdx)
-      var i = 0
-      while i < bucket.size do
-        if query.fastSubsetOf(bucket(i)) then return true
-        i += 1
-      bucketIdx += 1
+    val q = load(query)
+    var b = query.size
+    while b <= maxSize do
+      if buckets(b).hasSupersetOf(q) then return true
+      b += 1
     false
 
-  /** Find all stored BitSets that are supersets of the query. */
+  /** Find all stored BitSets that are supersets of the query (query included). */
   def findSupersetsOf(query: BitSet): mutable.ArrayBuffer[BitSet] =
     val result = mutable.ArrayBuffer[BitSet]()
-    val querySize = query.size
-    var bucketIdx = querySize
-    while bucketIdx <= maxSize do
-      val bucket = buckets(bucketIdx)
-      var i = 0
-      while i < bucket.size do
-        if query.fastSubsetOf(bucket(i)) then result += bucket(i)
-        i += 1
-      bucketIdx += 1
+    val q = load(query)
+    var b = query.size
+    while b <= maxSize do
+      buckets(b).collectSupersetsOf(q, result)
+      b += 1
     result
 
-  /** Find all stored BitSets that are subsets of the query. */
+  /** Find all stored BitSets that are subsets of the query (query included). */
   def findSubsetsOf(query: BitSet): mutable.ArrayBuffer[BitSet] =
     val result = mutable.ArrayBuffer[BitSet]()
+    val q = load(query)
     val querySize = query.size
-    var bucketIdx = 0
-    while bucketIdx <= querySize && bucketIdx <= maxSize do
-      val bucket = buckets(bucketIdx)
-      var i = 0
-      while i < bucket.size do
-        if bucket(i).fastSubsetOf(query) then result += bucket(i)
-        i += 1
-      bucketIdx += 1
+    var b = 0
+    while b <= querySize do
+      buckets(b).collectSubsetsOf(q, result)
+      b += 1
     result
 
-  /** Remove all stored BitSets that are supersets of the query. */
+  /** Remove all stored BitSets that are strict supersets of the query. A
+    * superset of equal popcount is the query itself, so the scan can start one
+    * bucket above it.
+    */
   def removeSupersetsOf(query: BitSet): mutable.ArrayBuffer[BitSet] =
     val removed = mutable.ArrayBuffer[BitSet]()
-    val querySize = query.size
-    var bucketIdx = querySize
-    while bucketIdx <= maxSize do
-      val bucket = buckets(bucketIdx)
-      val toRemove = mutable.ArrayBuffer[BitSet]()
-      var i = 0
-      while i < bucket.size do
-        val bs = bucket(i)
-        if query.fastSubsetOf(bs) && !bs.fastEquals(query) then toRemove += bs
-        i += 1
-      for bs <- toRemove do
-        bucket.remove(bs)
-        totalSize -= 1
-        removed += bs
-      bucketIdx += 1
+    val q = load(query)
+    var b = query.size + 1
+    while b <= maxSize do
+      totalSize -= buckets(b).removeSupersetsOf(q, removed)
+      b += 1
     removed
 
-  /** Remove all stored BitSets that are subsets of the query. */
+  /** Remove all stored BitSets that are strict subsets of the query. */
   def removeSubsetsOf(query: BitSet): mutable.ArrayBuffer[BitSet] =
     val removed = mutable.ArrayBuffer[BitSet]()
+    val q = load(query)
     val querySize = query.size
-    var bucketIdx = 0
-    while bucketIdx <= querySize && bucketIdx <= maxSize do
-      val bucket = buckets(bucketIdx)
-      val toRemove = mutable.ArrayBuffer[BitSet]()
-      var i = 0
-      while i < bucket.size do
-        val bs = bucket(i)
-        if bs.fastSubsetOf(query) && !bs.fastEquals(query) then toRemove += bs
-        i += 1
-      for bs <- toRemove do
-        bucket.remove(bs)
-        totalSize -= 1
-        removed += bs
-      bucketIdx += 1
+    var b = 0
+    while b < querySize do
+      totalSize -= buckets(b).removeSubsetsOf(q, removed)
+      b += 1
     removed
 
   /** Check if any element satisfies predicate */
   def exists(p: BitSet => Boolean): Boolean =
-    var bucketIdx = 0
-    while bucketIdx <= maxSize do
-      if buckets(bucketIdx).exists(p) then return true
-      bucketIdx += 1
+    var b = 0
+    while b <= maxSize do
+      if buckets(b).exists(p) then return true
+      b += 1
     false
 
-  /** In-place filter, keeps only elements satisfying predicate */
-  def filterInPlace(p: BitSet => Boolean): Unit =
-    var bucketIdx = 0
-    while bucketIdx <= maxSize do
-      val bucket = buckets(bucketIdx)
-      val oldSize = bucket.size
-      bucket.filterInPlace(p)
-      totalSize -= (oldSize - bucket.size)
-      bucketIdx += 1
-
-  /** Filter and collect elements satisfying predicate */
-  def filter(p: BitSet => Boolean): mutable.ArrayBuffer[BitSet] =
-    val result = mutable.ArrayBuffer[BitSet]()
-    var bucketIdx = 0
-    while bucketIdx <= maxSize do
-      val bucket = buckets(bucketIdx)
-      var i = 0
-      while i < bucket.size do
-        if p(bucket(i)) then result += bucket(i)
-        i += 1
-      bucketIdx += 1
-    result
+  def foreach(f: BitSet => Unit): Unit =
+    var b = 0
+    while b <= maxSize do
+      buckets(b).foreach(f)
+      b += 1
 
   def iterator: Iterator[BitSet] =
     buckets.iterator.flatMap(_.iterator)
 
   def toSeq: Seq[BitSet] =
     val result = mutable.ArrayBuffer[BitSet]()
-    var bucketIdx = 0
-    while bucketIdx <= maxSize do
-      result ++= buckets(bucketIdx).toSeq
-      bucketIdx += 1
+    foreach(result += _)
     result.toSeq
 
   override def toString: String =

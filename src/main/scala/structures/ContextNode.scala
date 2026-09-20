@@ -18,6 +18,16 @@ class ContextNode(
   // Map[attribute number, TreeMap[value, tuples]]
   private val sortedAttributes =
     AttributeIndexed[Option[SortedAttribute]](plis.size)(None)
+  // Which attributes of `sortedAttributes` are actually built. Only those need
+  // maintaining per tuple, and a node typically holds one or two of them, so
+  // walking this instead of every attribute of the relation matters on wide
+  // datasets.
+  private var builtAttributes: Array[AttributeId] = Array.emptyIntArray
+
+  /** Set whenever a tuple lands in this node, cleared by an eviction sweep, so
+    * a sweep can tell nodes used since the last one from cold nodes.
+    */
+  var recentlyUsed: Boolean = true
 
   def hasSortedAttribute(attr: AttributeId): Boolean =
     sortedAttributes(attr).isDefined
@@ -30,30 +40,33 @@ class ContextNode(
       case None =>
         val treeMap = buildSortedAttribute(attr)
         sortedAttributes(attr) = Some(treeMap)
+        builtAttributes = builtAttributes :+ attr
         treeMap
 
   def insertTuple(id: TupleId, tuple: IndexedSeq[TupleValue]): Unit =
+    recentlyUsed = true
     tuples.add(id)
-    for attr <- plis.indices do
-      sortedAttributes(attr) match
-        case Some(treeMap) =>
-          val bitmap = treeMap.getOrElseUpdate(tuple(attr), new RoaringBitmap())
-          bitmap.add(id)
-        case None =>
+    var i = 0
+    while i < builtAttributes.length do
+      val attr = builtAttributes(i)
+      val treeMap = sortedAttributes(attr).get
+      treeMap.getOrElseUpdate(tuple(attr), new RoaringBitmap()).add(id)
+      i += 1
     addToMinMaxCache(tuple, id)
 
   def removeTuple(id: TupleId, tuple: IndexedSeq[TupleValue]): Unit =
     tuples.remove(id)
-    for attr <- plis.indices do
-      sortedAttributes(attr) match
-        case Some(treeMap) =>
-          treeMap.get(tuple(attr)) match
-            case Some(bitmap) =>
-              bitmap.remove(id)
-              if bitmap.isEmpty then treeMap.remove(tuple(attr))
-            case None =>
+    var i = 0
+    while i < builtAttributes.length do
+      val attr = builtAttributes(i)
+      val treeMap = sortedAttributes(attr).get
+      treeMap.get(tuple(attr)) match
+        case Some(bitmap) =>
+          bitmap.remove(id)
+          if bitmap.isEmpty then treeMap.remove(tuple(attr))
         case None =>
-      deleteFromMinMaxCache(tuple, id)
+      i += 1
+    deleteFromMinMaxCache(tuple, id)
 
   def buildSortedAttribute(attr: AttributeId): SortedAttribute =
     val treeMap = mutable.TreeMap[TupleValue, RoaringBitmap]()

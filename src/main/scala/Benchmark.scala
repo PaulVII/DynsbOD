@@ -43,14 +43,22 @@ object Benchmark extends StrictLogging:
   def main(args: Array[String]): Unit =
     setupLogging(args.contains("--verbose"))
 
-    val configFiles = findConfigFiles()
+    // Optional positional args filter which configs run, matched against the
+    // config file name (substring). Without them, all benchmark configs run.
+    val filters = args.filterNot(_.startsWith("--"))
+    val configFiles = findConfigFiles().filter(p =>
+      filters.isEmpty || filters.exists(p.getFileName.toString.contains)
+    )
     if configFiles.isEmpty then
       logger.error("No config files found in configs/benchmark")
       System.exit(1)
 
     logger.info(s"Found ${configFiles.length} config files")
     val results = configFiles.map(runBenchmarkWithGc)
-    saveBenchmarkReport(results.toList)
+    val reportPath = args
+      .collectFirst { case a if a.startsWith("--out=") => a.drop(6) }
+      .getOrElse("benchmark_report.json")
+    saveBenchmarkReport(results.toList, reportPath)
 
     val (passed, failed) = results.partition(_.success)
     logger.info(
@@ -309,12 +317,15 @@ object Benchmark extends StrictLogging:
     val result = block
     (result, System.currentTimeMillis() - start)
 
-  private def saveBenchmarkReport(results: List[BenchmarkResult]): Unit =
+  private def saveBenchmarkReport(
+      results: List[BenchmarkResult],
+      reportPath: String
+  ): Unit =
     implicit val encoder: Encoder[BenchmarkResult] = deriveEncoder
     val json = Json.obj(
       "generatedAt" -> Json.fromString(java.time.Instant.now().toString),
       "totalConfigs" -> Json.fromInt(results.length),
       "results" -> Json.fromValues(results.map(_.asJson))
     )
-    Files.write(Path.of("benchmark_report.json"), json.spaces2.getBytes())
-    logger.info("Benchmark report saved to benchmark_report.json")
+    Files.write(Path.of(reportPath), json.spaces2.getBytes())
+    logger.info(s"Benchmark report saved to $reportPath")

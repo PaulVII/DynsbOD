@@ -223,7 +223,6 @@ class MaxNonOdIndex(
       for key <- keysToUpdate do
         // val newNonOds = calculateNonOds(key)
         // val odsBefore = mutable.Set.from(maxNonOds(key))
-        val oldSet = maxNonOds(key).toSeq.toSet
         val minOdNode = odIndex.odNodes(key)
         val includedAttrs = key.includedAttributes.to(BitSet)
         val minOds = minOdNode.iterateMinOds ++ minOdNode.propagateOds
@@ -231,16 +230,13 @@ class MaxNonOdIndex(
             // _.iterateMinOds
               _.iterateMinOds.filter(bs => (bs & includedAttrs).isEmpty)
           )
-        handleInvalidationIncremental(
+        val (removedOds, addedOds) = handleInvalidationIncremental(
           nonOd.context,
           maxNonOds(key),
           minOds,
           key
         )
         // assert(nonOdsIncremental == newNonOds)
-        val newSet = maxNonOds(key).toSeq.toSet
-        val removedOds = oldSet -- newSet
-        val addedOds = newSet -- oldSet
         updateViolationTrackingFor(
           removedOds,
           addedOds,
@@ -248,12 +244,15 @@ class MaxNonOdIndex(
           -1
         )
 
+  /** @return
+    *   the maximal non-ODs this removed from and added to `nonOds`
+    */
   def handleInvalidationIncremental(
       newNonOd: BitSet,
       nonOds: SizeBucketedBitSets,
       ods: Iterator[BitSet],
       key: OdKey
-  ): Unit =
+  ): (mutable.ArrayBuffer[BitSet], mutable.ArrayBuffer[BitSet]) =
     val allAttributes = (0 until numAttributes).toSet -- key.includedAttributes
     // Sort by size ascending, then incrementally keep only minimal hyperedges.
     // For each candidate, we only check against already-accepted (smaller/equal) hyperedges.
@@ -269,9 +268,20 @@ class MaxNonOdIndex(
     )
     val newNonOds =
       minHittingSets.map(allAttributes -- _).map(BitSet.fromSpecific)
+
+    // Report the delta directly instead of letting the caller diff a snapshot
+    // of the whole collection taken before and after.
+    val added = mutable.ArrayBuffer[BitSet]()
+    val removed = mutable.ArrayBuffer[BitSet]()
     for newNonOd <- newNonOds do
       val wasInserted = nonOds.add(newNonOd)
-      if wasInserted then nonOds.removeSubsetsOf(newNonOd)
+      if wasInserted then
+        added += newNonOd
+        for gone <- nonOds.removeSubsetsOf(newNonOd) do
+          // a context added earlier in this same loop and dropped again nets out
+          val addedIdx = added.indexOf(gone)
+          if addedIdx >= 0 then added.remove(addedIdx) else removed += gone
+    (removed, added)
 
   def handleAddedOd(
       newOd: BitSet,

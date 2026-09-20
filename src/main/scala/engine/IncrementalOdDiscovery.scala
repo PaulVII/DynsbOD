@@ -43,6 +43,13 @@ final class IncrementalOdDiscovery(
     )
 
   var numCacheEvictions = 0
+  var numFullCacheEvictions = 0
+
+  /** Scratch space for collecting violating tuples. Reused across calls, since
+    * an OD validation usually finds none and should not allocate; results are
+    * copied out before the buffer is handed to the next validation.
+    */
+  private val violationScratch = mutable.ArrayBuffer[TupleId]()
 
   // Maps to track relationship between tuple IDs (position-based, changes on update)
   // and record IDs (stable identifiers from the data source)
@@ -95,6 +102,11 @@ final class IncrementalOdDiscovery(
     val availableCols =
       BitSet.ones(numAttributes) -- invalidatedConstant.includedCols
 
+    // Compared against each derived Compatible's violations below. Built once,
+    // as a set, so the comparison is not an accidental Set-vs-Seq mismatch
+    // (which is never equal and silently disables the pruning).
+    val constantViolationSet = constantViolations.toSet
+
     val ods = for
       col <- availableCols.toSeq
       sameDirection <- Seq(true, false)
@@ -104,14 +116,17 @@ final class IncrementalOdDiscovery(
         col,
         sameDirection
       )
-    // possible optimization: if one direction was valid without adding more
-    // attributes, the other direction will have the same violating tuples as the
-    // FD, therefore it will not yield anything useful and all will be nonminimal
-    // by the newly generated Constants
+    // if one direction was valid without adding more attributes, the other
+    // direction will have the same violating tuples as the FD, therefore it
+    // will not yield anything useful and all will be nonminimal by the newly
+    // generated Constants
     yield getViolatingCompatible(invalidatingTuple, newOd, itData) match
-      case invalids if invalids.isEmpty               => Set(newOd)
-      case invalids if invalids == constantViolations => Set.empty
-      case invalids                                   =>
+      case invalids if invalids.isEmpty => Set(newOd)
+      case invalids
+          if invalids.size == constantViolationSet.size
+            && invalids.forall(constantViolationSet.contains) =>
+        Set.empty
+      case invalids =>
         // this includes many redundant ODs, but makes sure
         // we find all ODs with contexts between the previous context
         // and the newly constructed constants (minimal hitting sets)
@@ -194,7 +209,7 @@ final class IncrementalOdDiscovery(
       nextCluster: TupleValue => Option[(TupleValue, RoaringBitmap)],
       tShouldBeSmaller: Boolean,
       minMaxCache: MinMaxCache,
-      invalidTuples: mutable.Set[TupleId]
+      invalidTuples: mutable.ArrayBuffer[TupleId]
   ): Unit =
     var currentValue = t(sortedAttrId)
     var nextClusterMightHaveInvalids = true
@@ -202,10 +217,10 @@ final class IncrementalOdDiscovery(
     while nextClusterMightHaveInvalids do
       nextCluster(currentValue) match
         case Some((nextValue, cluster)) =>
-          val newInvalids = mutable.Set.empty[TupleId]
           val it = cluster.iterator
           val potentiallyHasInvalids = minMaxCache.couldHaveViolations(
-            ClusterKey(sortedAttrId, nextValue),
+            sortedAttrId,
+            nextValue,
             otherAttrId,
             cluster.getCardinality,
             tShouldBeSmaller,
@@ -229,7 +244,7 @@ final class IncrementalOdDiscovery(
               if tShouldBeSmaller
               then otherValue < t(otherAttrId)
               else otherValue > t(otherAttrId)
-            if isViolating then newInvalids += id
+            if isViolating then invalidTuples += id
             else nextClusterMightHaveInvalids = false
 
           currentValue = nextValue
@@ -237,15 +252,14 @@ final class IncrementalOdDiscovery(
           if cluster.getCardinality >= algoConfig.minMaxCacheThreshold && potentiallyHasInvalids
           then
             minMaxCache.createNewMinMaxValue(
-              ClusterKey(sortedAttrId, currentValue),
+              sortedAttrId,
+              currentValue,
               otherAttrId,
               currentMin,
               currentMax,
               minId,
               maxId
             )
-
-          invalidTuples ++= newInvalids
 
         case None =>
           nextClusterMightHaveInvalids = false
@@ -257,7 +271,7 @@ final class IncrementalOdDiscovery(
       // expanding an invalid ConstantOd
       od: CompatibleOd,
       itData: IterationData
-  ): mutable.Set[TupleId] =
+  ): IndexedSeq[TupleId] =
 
     // if od.context
     //     == Set(7, 3, 9) && od.attr1 == 0 && od.attr2 == 10
@@ -267,7 +281,8 @@ final class IncrementalOdDiscovery(
       itData
     val otherAttrId = if od.attr1 == sortedAttrId then od.attr2 else od.attr1
 
-    val invalidTuples: mutable.Set[TupleId] = mutable.Set.empty
+    val invalidTuples = violationScratch
+    invalidTuples.clear()
 
     val progressivelySmallerAttr1Clusters = sortedAttribute.maxBefore
     // we don't need the actual value here, can just call next
@@ -296,7 +311,9 @@ final class IncrementalOdDiscovery(
         invalidTuples
       )
 
-    invalidTuples
+    // copied out, since the scratch buffer is reused by the next call
+    if invalidTuples.isEmpty then IndexedSeq.empty
+    else invalidTuples.toIndexedSeq
 
   def getViolating(
       t: IndexedSeq[TupleValue],
@@ -324,7 +341,7 @@ final class IncrementalOdDiscovery(
     logger.debug(s"Inserting tuple $id: $tuple")
     // if currentHighestId == 244
     // then logger.debug("Debug breakpoint")
-    plis.addTuples(Seq(tuple), id)
+    plis.addTuple(tuple, id)
     currentlyContainedTuples.add(id)
 
     // dataIndex.insertTuple(id, tuple)
@@ -431,7 +448,7 @@ final class IncrementalOdDiscovery(
   ): Unit =
     logger.debug(s"Deleting tuple $id: $tuple")
     currentlyContainedTuples.remove(id)
-    plis.removeTuples(Seq(id))
+    plis.removeTuple(id)
     dataIndex.removeTupleId(id, tuple)
     var didMaxNonOdsChange = true
 
@@ -824,12 +841,25 @@ final class IncrementalOdDiscovery(
       if (currentMemory.toFloat / Runtime.getRuntime.maxMemory) > 0.75
       then
         logger.warn(
-          s"Memory usage is above 90% (${currentMemory / 1024 / 1024} MB of ${Runtime.getRuntime.maxMemory / 1024 / 1024} MB) after event $index. Evicting all ContextNodes."
+          s"Memory usage is above 75% (${currentMemory / 1024 / 1024} MB of ${Runtime.getRuntime.maxMemory / 1024 / 1024} MB) after event $index. Evicting ContextNodes."
         )
         numCacheEvictions += 1
         // assert(numCacheEvictions < 1000)
-        dataIndex.removeAllContextNodes()
-        System.gc()
+        if algoConfig.partialCacheEviction then
+          val dropped = dataIndex.evictColdContextNodes()
+          System.gc()
+          // A sweep only reclaims the cold nodes. If that was not enough, fall
+          // back to clearing everything rather than sweeping in a loop.
+          if ((rt.totalMemory - rt.freeMemory).toFloat / rt.maxMemory) > 0.75
+          then
+            logger.warn(s"Sweep dropped $dropped nodes, still full: clearing")
+            numFullCacheEvictions += 1
+            dataIndex.removeAllContextNodes()
+            System.gc()
+        else
+          numFullCacheEvictions += 1
+          dataIndex.removeAllContextNodes()
+          System.gc()
         val currentMemoryAfter = rt.totalMemory - rt.freeMemory
 
         logger.warn(s"After GC trigger: ${currentMemoryAfter / 1024 / 1024}")

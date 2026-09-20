@@ -9,6 +9,8 @@ datasets/**/*.csv.txt
 # sbt specific
 dist/*
 target/
+# dynsbod-assembly-1.0.1.jar is force-added and therefore tracked despite this
+# rule -- .gitignore only applies to untracked files.
 lib_managed/
 src_managed/
 project/boot/

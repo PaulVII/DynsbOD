@@ -53,19 +53,27 @@ class ContextIndex(val plis: IndexedSeq[SortedPli])
       tuple: IndexedSeq[TupleValue]
   ): Iterator[IterationData] =
     addToMinMaxCache(tuple, id)
-    emptyContextOdIterator ++ (for
-      (context, aNode) <- attributeNodes.iterator
-      values = context.toIndexedSeq.map(tuple)
-      cNode = aNode._1.getOrElseUpdate(
-        values,
-        buildContextNode(context, values)
-      )
-      _ = cNode.insertTuple(id, tuple)
-      od <- aNode.ods
-    yield {
-      val attr: AttributeId = getCheapestPossibleAttribute(od, cNode, aNode)
-      IterationData(od, attr, cNode.getSortedAttribute(attr), cNode)
-    })
+    emptyContextOdIterator ++ attributeNodes.iterator.flatMap {
+      (context, aNode) =>
+        val values = context.toIndexedSeq.map(tuple)
+        val cNode = aNode.nodes.getOrElseUpdate(
+          values,
+          buildContextNode(context, values)
+        )
+        cNode.insertTuple(id, tuple)
+        // Two tuples can only violate an OD if they agree on its context, so an
+        // equivalence class holding nothing but the inserted tuple cannot
+        // violate any OD with this context. Skipping it also avoids
+        // materializing the node's sorted clusters, which would then have to be
+        // maintained for every later tuple.
+        if cNode.tuples.getCardinality < 2 then Iterator.empty
+        else
+          aNode.ods.iterator.map { od =>
+            val attr: AttributeId =
+              getCheapestPossibleAttribute(od, cNode, aNode)
+            IterationData(od, attr, cNode.getSortedAttribute(attr), cNode)
+          }
+    }
 
   def emptyContextOdIterator: Iterator[
     (IterationData)
@@ -196,11 +204,11 @@ class ContextIndex(val plis: IndexedSeq[SortedPli])
     attributeNodes.foreach { case (columns, attributeNode) =>
       if attributeNode.ods.isEmpty then attributeNodes.remove(columns)
       else
-        attributeNode.nodes.get(columns.toArray.map(tuple)) match
+        val values = columns.toArray.map(tuple)
+        attributeNode.nodes.get(values) match
           case Some(node) =>
             node.removeTuple(id, tuple)
-            if node.tuples.isEmpty then
-              attributeNode.nodes.remove(columns.toArray.map(tuple))
+            if node.tuples.isEmpty then attributeNode.nodes.remove(values)
           case None => ()
     }
 
@@ -248,8 +256,40 @@ class ContextIndex(val plis: IndexedSeq[SortedPli])
       tupleIds.and(bitmapsIter.next())
     ContextNode(values, tupleIds, plis)
 
+  /** Drops the value nodes that are not earning their memory, keeping the hot
+    * ones. Every context is visited on every insert, but only the *one* value
+    * node holding the inserted tuple's equivalence class is, so value nodes —
+    * which dominate memory — are the right granularity to evict.
+    *
+    * Two rules, in order:
+    *   - a singleton class is dropped outright: it cannot hold a violation
+    *     until it grows, and it only costs a rebuild if a matching tuple ever
+    *     arrives. On selective contexts these are nearly one per tuple and are
+    *     otherwise retained until the next full wipe.
+    *   - otherwise second-chance (CLOCK): nodes used since the last sweep
+    *     survive with their flag cleared, cold nodes are dropped. A repeated
+    *     sweep therefore escalates by itself.
+    *
+    * @return
+    *   the number of value nodes dropped
+    */
+  def evictColdContextNodes(): Int =
+    var dropped = 0
+    attributeNodes.foreach { case (_, attributeNode) =>
+      attributeNode.nodes.filterInPlace { (_, contextNode) =>
+        if contextNode.tuples.getCardinality < 2 || !contextNode.recentlyUsed
+        then
+          dropped += 1
+          false
+        else
+          contextNode.recentlyUsed = false
+          true
+      }
+    }
+    dropped
+
   def removeAllContextNodes(): Unit =
-    minMaxCache.clear
+    clearMinMaxCache()
     attributeNodes.values.foreach { case attributeNode =>
       attributeNode.nodes.clear()
     // try to just clear sortedAttributes - slower
